@@ -385,6 +385,12 @@ jobs:
           }
 
           open_issues=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 1000 --json number,body)
+          closed_here=$(gh issue list -R "$GITHUB_REPOSITORY" --state closed --limit 200 --json number,body,url)
+
+          skip_closed() {
+            note "Signature $1 already reported in closed $2. No issue opened."
+            record "$1" "$2" "$3" "$4"
+          }
 
           for group in "${group_dirs[@]}"; do
             group=${group%/}
@@ -393,11 +399,11 @@ jobs:
             error_line=$(cat "$group/error.txt" 2>/dev/null || echo "unknown error")
             commands=$(sort -u "$group/commands.txt")
             command_list=$(sed 's/^/- /' <<<"$commands")
+            note "Matching signature ${sig}; command: ${commands//$'\n'/ | }; error: ${error_line}"
             recurrence=$(printf 'Failed again with the same error.\n\nRun: %s\nCommit: %s\nFailed commands:\n%s\n' \
               "$RUN_URL" "$SOURCE_SHA" "$command_list")
 
             target=""
-            previous=""
             entry=$(jq -c --arg sig "$sig" '.[$sig] // empty' ledger.json)
             if [[ -n "$entry" ]]; then
               recorded_repo=$(jq -r '.repo' <<<"$entry")
@@ -414,7 +420,8 @@ jobs:
                   record "$sig" "$url" "$current_repo" "$number"
                   continue
                 else
-                  previous=$url
+                  skip_closed "$sig" "$url" "$current_repo" "$number"
+                  continue
                 fi
               elif grep -q 'HTTP 410' lookup.err; then
                 note "Signature ${sig} was tracked in ${recorded_repo}#${recorded_number}, which was deleted. Opening a new issue."
@@ -427,10 +434,16 @@ jobs:
               fi
             fi
 
-            if [[ -z "$target" && -z "$previous" ]]; then
+            if [[ -z "$target" ]]; then
               target=$(jq -r --arg marker "$marker" \
                 'map(select((.body // "") | contains($marker))) | sort_by(.number) | .[0].number // empty' <<<"$open_issues")
               if [[ -z "$target" ]]; then
+                closed_match=$(jq -c --arg marker "$marker" \
+                  'map(select((.body // "") | contains($marker))) | sort_by(.number) | last // empty' <<<"$closed_here")
+                if [[ -n "$closed_match" ]]; then
+                  skip_closed "$sig" "$(jq -r '.url' <<<"$closed_match")" "$GITHUB_REPOSITORY" "$(jq -r '.number' <<<"$closed_match")"
+                  continue
+                fi
                 if ! found=$(GH_TOKEN="$LOOKUP_TOKEN" gh search issues "$sig" --owner "$GITHUB_REPOSITORY_OWNER" \
                     --limit 30 --json number,state,url,repository,body,updatedAt 2> search.err); then
                   echo "::warning::Searching ${GITHUB_REPOSITORY_OWNER} for signature ${sig} failed: $(cat search.err)"
@@ -439,8 +452,8 @@ jobs:
                 open_match=$(jq -c --arg marker "$marker" --arg repo "$GITHUB_REPOSITORY" '
                   map(select(((.body // "") | contains($marker)) and (.state | ascii_downcase) == "open"))
                   | sort_by(.repository.nameWithOwner != $repo) | .[0] // empty' <<<"$found")
-                closed_match=$(jq -c --arg marker "$marker" '
-                  map(select(((.body // "") | contains($marker)) and (.state | ascii_downcase) != "open"))
+                transferred_closed=$(jq -c --arg marker "$marker" --arg repo "$GITHUB_REPOSITORY" '
+                  map(select(((.body // "") | contains($marker)) and (.state | ascii_downcase) != "open" and .repository.nameWithOwner != $repo))
                   | sort_by(.updatedAt) | last // empty' <<<"$found")
                 if [[ -n "$open_match" ]]; then
                   match_repo=$(jq -r '.repository.nameWithOwner' <<<"$open_match")
@@ -453,8 +466,9 @@ jobs:
                     record "$sig" "$match_url" "$match_repo" "$match_number"
                     continue
                   fi
-                elif [[ -n "$closed_match" ]]; then
-                  previous=$(jq -r '.url' <<<"$closed_match")
+                elif [[ -n "$transferred_closed" ]]; then
+                  skip_closed "$sig" "$(jq -r '.url' <<<"$transferred_closed")" "$(jq -r '.repository.nameWithOwner' <<<"$transferred_closed")" "$(jq -r '.number' <<<"$transferred_closed")"
+                  continue
                 fi
               fi
             fi
@@ -497,9 +511,6 @@ jobs:
               printf '%s\n\n' "$marker"
               printf 'Failure signature: %s\n\n' "$sig"
               printf 'Run: %s\nRef: %s\nCommit: %s\nJuju channel: %s\n\n' "$RUN_URL" "$SOURCE_REF" "$SOURCE_SHA" "$JUJU_CHANNEL"
-              if [[ -n "$previous" ]]; then
-                printf 'Previously tracked in %s, which is closed.\n\n' "$previous"
-              fi
               printf 'Error:\n\n~~~~text\n%s\n~~~~\n\n' "$error_line"
               printf 'Failed commands:\n%s\n\n' "$command_list"
               printf '## Failure summary\n'
